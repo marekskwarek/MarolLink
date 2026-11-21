@@ -1,0 +1,160 @@
+name: Build & Publish MarolLink Release
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  workflow_dispatch:
+    inputs:
+      release_notes:
+        description: "Krótki opis zmian (opcjonalny)"
+        required: false
+        type: string
+      force_publish:
+        description: "Opublikuj GitHub Release (odznacz, aby tylko przetestować kompilację)"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+
+      - name: Read app version and decide release mode
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION_CODE=$(grep -E '^VERSION_CODE=' version.properties | cut -d'=' -f2 | tr -d '[:space:]')
+          VERSION_NAME=$(grep -E '^VERSION_NAME=' version.properties | cut -d'=' -f2 | tr -d '[:space:]')
+          TAG="v${VERSION_NAME}"
+
+          echo "version_code=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
+          echo "version_name=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${TAG}" >> "$GITHUB_OUTPUT"
+
+          SHOULD_RELEASE="false"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ inputs.force_publish }}" = "true" ]; then
+              SHOULD_RELEASE="true"
+            fi
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            SHOULD_RELEASE="true"
+          elif ! gh release view "${TAG}" >/dev/null 2>&1; then
+            SHOULD_RELEASE="true"
+          fi
+
+          echo "should_release=${SHOULD_RELEASE}" >> "$GITHUB_OUTPUT"
+          echo "Version: ${VERSION_NAME} (code ${VERSION_CODE}), tag: ${TAG}, should_release: ${SHOULD_RELEASE}"
+
+      - name: Run unit tests
+        run: gradle testDebugUnitTest
+
+      - name: Build Debug APK when not publishing a release
+        if: steps.meta.outputs.should_release != 'true'
+        run: gradle assembleDebug
+
+      - name: Verify signing secrets are configured
+        if: steps.meta.outputs.should_release == 'true'
+        env:
+          B64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+          SPW: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
+          ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          KPW: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          if [ -z "$B64" ] || [ -z "$SPW" ] || [ -z "$ALIAS" ] || [ -z "$KPW" ]; then
+            echo "::error::Brakuje jednego z sekretów podpisu (SIGNING_KEYSTORE_BASE64, SIGNING_KEYSTORE_PASSWORD, SIGNING_KEY_ALIAS, SIGNING_KEY_PASSWORD) w GitHub Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+      - name: Decode release keystore
+        if: steps.meta.outputs.should_release == 'true'
+        env:
+          KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+        run: |
+          printf '%s' "$KEYSTORE_B64" | tr -d '[:space:]' | base64 --decode > "${{ github.workspace }}/app/release-keystore.jks"
+
+      - name: Build signed Release APK
+        if: steps.meta.outputs.should_release == 'true'
+        env:
+          SIGNING_STORE_FILE: ${{ github.workspace }}/app/release-keystore.jks
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: gradle assembleRelease
+
+      - name: Verify APK signature and generate SHA-256 checksum
+        if: steps.meta.outputs.should_release == 'true'
+        env:
+          TAG: ${{ steps.meta.outputs.tag_name }}
+        run: |
+          APK_SOURCE=$(find app/build/outputs/apk/release -maxdepth 1 -name "*.apk" | head -n 1)
+          if [ -z "$APK_SOURCE" ]; then
+            echo "::error::Nie znaleziono zbudowanego pliku APK w app/build/outputs/apk/release/"
+            exit 1
+          fi
+          mkdir -p dist
+          OUT_APK="MarolLink-${TAG}.apk"
+          cp "$APK_SOURCE" "dist/${OUT_APK}"
+          APKSIGNER=$(find "${ANDROID_HOME}/build-tools" -name "apksigner" | sort -V | tail -n 1)
+          if [ -n "$APKSIGNER" ]; then
+            "$APKSIGNER" verify --print-certs "dist/${OUT_APK}"
+          fi
+          (cd dist && sha256sum "${OUT_APK}" > "${OUT_APK}.sha256")
+          cat "dist/${OUT_APK}.sha256"
+
+      - name: Upload workflow APK artifact
+        if: steps.meta.outputs.should_release == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: MarolLink-${{ steps.meta.outputs.tag_name }}
+          path: dist/*
+
+      - name: Publish GitHub Release
+        if: steps.meta.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag_name }}
+          CUSTOM_NOTES: ${{ github.event.inputs.release_notes }}
+        run: |
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "::error::Wydanie ${TAG} już istnieje. Podnieś VERSION_CODE i VERSION_NAME w pliku version.properties przed nowym wydaniem."
+            exit 1
+          fi
+
+          OUT_APK="dist/MarolLink-${TAG}.apk"
+          OUT_SHA="dist/MarolLink-${TAG}.apk.sha256"
+
+          if [ -n "$CUSTOM_NOTES" ]; then
+            gh release create "${TAG}" "${OUT_APK}" "${OUT_SHA}" \
+              --title "MarolLink ${TAG}" \
+              --notes "${CUSTOM_NOTES}"
+          else
+            gh release create "${TAG}" "${OUT_APK}" "${OUT_SHA}" \
+              --title "MarolLink ${TAG}" \
+              --generate-notes
+          fi
+
+      - name: Cleanup decoded keystore
+        if: always()
+        run: rm -f "${{ github.workspace }}/app/release-keystore.jks"
